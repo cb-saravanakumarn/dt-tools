@@ -32,16 +32,24 @@ const { execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
-// ─── CLI args ────────────────────────────────────────────────────────────────
+// Output files always written to the runner working directory (process.cwd())
+// which is the runner root when invoked from CI without working-directory set.
+const OUT_DIR = process.cwd();
+
 const args = process.argv.slice(2);
 const baseRef = args[args.indexOf("--base") + 1] || "HEAD~1";
 const dryRun = args.includes("--dry-run");
 
-// ─── Git helpers ─────────────────────────────────────────────────────────────
-// cwd defaults to process.cwd() — override via GIT_WORK_DIR env if the script
-// is invoked from a different directory than the repo (e.g. CI runner root).
-const GIT_CWD = process.env.GIT_WORK_DIR || process.cwd();
+// ─── Git working directory ────────────────────────────────────────────────────
+// When invoked from CI runner root, GIT_WORK_DIR points to the checked-out repo.
+// Falls back to process.cwd() for local runs.
+const GIT_CWD = process.env.GIT_WORK_DIR
+  ? require("path").resolve(process.env.GIT_WORK_DIR)
+  : process.cwd();
 
+console.log(`Git working directory: ${GIT_CWD}`);
+
+// ─── Git helpers ─────────────────────────────────────────────────────────────
 function git(cmd) {
   try {
     return execSync(`git ${cmd}`, {
@@ -410,8 +418,8 @@ function buildPayload(result, base) {
   if (!result || result.contributors.length === 0) {
     console.log("No commits found between base and HEAD.");
     // Write empty markers so the YAML comment step exits cleanly
-    fs.writeFileSync("report-output.txt", "");
-    fs.writeFileSync("report-payload.json", "{}");
+    fs.writeFileSync(path.join(OUT_DIR, "report-output.txt"), "", "utf8");
+    fs.writeFileSync(path.join(OUT_DIR, "report-payload.json"), "{}", "utf8");
     process.exit(0);
   }
 
@@ -428,17 +436,14 @@ function buildPayload(result, base) {
     reportText = markdown;
   }
 
-  fs.writeFileSync("report-output.txt", reportText, "utf8");
-  console.log("Written: report-output.txt");
+  const reportPath = path.join(OUT_DIR, "report-output.txt");
+  const payloadPath = path.join(OUT_DIR, "report-payload.json");
 
-  // ── Write JSON payload (report-payload.json) ─────────────────────────────
-  const payload = buildPayload(result, baseRef);
-  fs.writeFileSync(
-    "report-payload.json",
-    JSON.stringify(payload, null, 2),
-    "utf8",
-  );
-  console.log("Written: report-payload.json");
+  fs.writeFileSync(reportPath, reportText, "utf8");
+  console.log(`Written: ${reportPath}`);
+
+  fs.writeFileSync(payloadPath, JSON.stringify(payload, null, 2), "utf8");
+  console.log(`Written: ${payloadPath}`);
 
   // Summary to stdout
   const dtC = result.contributors.filter((c) => c.author_type === "DT");

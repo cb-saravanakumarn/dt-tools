@@ -1,437 +1,389 @@
-#!/usr/bin/env node
 /**
- * dt-cb-git-contribution-tracker.js
+ * dt-cb-git-contribution-push-to-sheets.js
  *
- * Analyses git commits on a branch against a base ref and produces:
- *   1. report-output.txt   — markdown report (for PR comment)
- *   2. report-payload.json — structured JSON (for push-to-sheets.js)
+ * Reads the JSON payload from dt-contribution-tracker.js (--output json)
+ * and appends one row per author to the Google Sheet raw_logs tab.
+ *
+ * Metrics supported:
+ *  - % file DT contribution   (via files_detail JSON)
+ *  - % branch contribution    (via lines_added + author_type)
+ *  - % repo contribution      (via repo + lines_added + author_type)
+ *  - % overwrites on DT work  (via dt_files_touched + dev_lines_on_dt_files)
+ *
+ * DT member detection: reads dt_members tab from the same sheet.
+ * Falls back to DT_MEMBERS env var if tab is empty or unreachable.
  *
  * Usage:
- *   node dt-cb-git-contribution-tracker.js \
- *     --base origin/dt/skills-test \
- *     --repo-dir /absolute/path/to/repo \
- *     --dry-run
- *
- * DT member detection (priority order):
- *   1. DT_MEMBERS env var  e.g. "alice,bob,carol"
- *   2. .dt-members file in repo root (one login per line)
- *   3. Treats ALL authors as DT if neither is set
- *
- * GitHub Actions env vars (injected by YAML):
- *   GH_REPO, GH_PR_NUMBER, GH_PR_TITLE, GH_PR_URL, GH_RUN_ID
+ *   node push-to-sheets.js --payload report-payload.json
  */
 
-"use strict";
-
-const { execFileSync } = require("child_process");
 const fs = require("fs");
-const path = require("path");
+const https = require("https");
+const { createSign } = require("crypto");
 
-// ─── CLI args — parsed FIRST before anything else ────────────────────────────
+// ─── CLI args ────────────────────────────────────────────────────────────────
 const args = process.argv.slice(2);
-const baseRef = args[args.indexOf("--base") + 1] || "HEAD~1";
-const dryRun = args.includes("--dry-run");
-const repoDirIdx = args.indexOf("--repo-dir");
-const repoDir = repoDirIdx !== -1 ? args[repoDirIdx + 1] : null;
+const payloadFlag = args.indexOf("--payload");
+if (payloadFlag === -1 || !args[payloadFlag + 1]) {
+  console.error("Usage: node push-to-sheets.js --payload <path>");
+  process.exit(1);
+}
 
-console.log(`[ARGS] base=${baseRef} dryRun=${dryRun} repoDir=${repoDir}`);
-
-// ─── Paths ────────────────────────────────────────────────────────────────────
-const GIT_CWD = repoDir || process.env.GIT_WORK_DIR || process.cwd();
-const OUT_DIR = process.cwd();
-
-console.log(`[PATHS] GIT_CWD=${GIT_CWD}`);
-console.log(`[PATHS] OUT_DIR=${OUT_DIR}`);
-
-// ─── Git sanity check ─────────────────────────────────────────────────────────
+let payload;
 try {
-  const headHash = execFileSync("git", ["rev-parse", "HEAD"], {
-    cwd: GIT_CWD,
-    encoding: "utf8",
-  }).trim();
-  const logOut = execFileSync("git", ["log", `${baseRef}..HEAD`, "--oneline"], {
-    cwd: GIT_CWD,
-    encoding: "utf8",
-  }).trim();
-  console.log(`[GIT SANITY] HEAD=${headHash}`);
-  console.log(
-    `[GIT SANITY] commits in range=${logOut.split("\n").filter(Boolean).length}`,
-  );
-} catch (e) {
-  console.log(`[GIT SANITY ERROR] ${e.message} ${e.stderr || ""}`);
+  payload = JSON.parse(fs.readFileSync(args[payloadFlag + 1], "utf8"));
+} catch (err) {
+  console.error(`Failed to read payload: ${err.message}`);
+  process.exit(1);
 }
 
-// ─── Git helper ───────────────────────────────────────────────────────────────
-// Uses execFileSync so args are never passed through /bin/sh.
-// Prevents % format specifiers being interpreted as shell commands.
-function git(...gitArgs) {
-  try {
-    return execFileSync("git", gitArgs, {
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "pipe"],
-      cwd: GIT_CWD,
-    }).trim();
-  } catch (e) {
-    console.log(
-      `[GIT ERROR] git ${gitArgs.join(" ")} => ${e.stderr || e.message}`,
+// ─── Env ─────────────────────────────────────────────────────────────────────
+const credsRaw = process.env.GOOGLE_SHEETS_CREDENTIALS;
+const sheetId = process.env.GOOGLE_SHEET_ID;
+// Optional fallback: comma-separated DT logins e.g. "alice,bob,carol"
+const dtMembersEnv = (process.env.DT_MEMBERS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+if (!credsRaw || !sheetId) {
+  console.error("Missing GOOGLE_SHEETS_CREDENTIALS or GOOGLE_SHEET_ID");
+  process.exit(1);
+}
+
+let creds;
+try {
+  creds = JSON.parse(credsRaw);
+} catch {
+  console.error("GOOGLE_SHEETS_CREDENTIALS is not valid JSON");
+  process.exit(1);
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+function base64url(buf) {
+  return Buffer.from(buf)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=/g, "");
+}
+
+function deriveFeatureTag(branch = "") {
+  const parts = branch.split("/");
+  return parts[parts.length - 1] || branch;
+}
+
+// ─── Google Auth (no-SDK JWT) ─────────────────────────────────────────────────
+async function getAccessToken(creds) {
+  const now = Math.floor(Date.now() / 1000);
+  const claim = {
+    iss: creds.client_email,
+    scope: "https://www.googleapis.com/auth/spreadsheets",
+    aud: "https://oauth2.googleapis.com/token",
+    iat: now,
+    exp: now + 3600,
+  };
+  const header = base64url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
+  const body = base64url(JSON.stringify(claim));
+  const msg = `${header}.${body}`;
+  const sign = createSign("RSA-SHA256");
+  sign.update(msg);
+  const jwt = `${msg}.${base64url(sign.sign(creds.private_key))}`;
+  const post = `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`;
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: "oauth2.googleapis.com",
+        path: "/token",
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      },
+      (res) => {
+        let d = "";
+        res.on("data", (c) => (d += c));
+        res.on("end", () => {
+          try {
+            const p = JSON.parse(d);
+            p.access_token
+              ? resolve(p.access_token)
+              : reject(new Error(`Auth failed: ${d}`));
+          } catch (e) {
+            reject(e);
+          }
+        });
+      },
     );
-    return "";
-  }
+    req.on("error", reject);
+    req.write(post);
+    req.end();
+  });
 }
 
-// ─── Git data fetchers ────────────────────────────────────────────────────────
-function getCommits(base) {
-  const log = git("log", `${base}..HEAD`, "--format=%H|%as|%ae|%s");
-  if (!log) return [];
-  return log
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => {
-      const [hash, date, email, ...msgParts] = line.split("|");
-      return {
-        hash: hash.slice(0, 8),
-        date,
-        email,
-        message: msgParts.join("|"),
-      };
-    });
+// ─── Cell size safety ─────────────────────────────────────────────────────────
+// Google Sheets hard limit: 50,000 chars per cell.
+// We cap well below that to leave headroom.
+const CELL_LIMIT = 40000;
+
+function safeCell(value) {
+  if (typeof value !== "string") return value;
+  return value.length > CELL_LIMIT
+    ? value.slice(0, CELL_LIMIT) + `\n[truncated — ${value.length} total chars]`
+    : value;
+}
+function sheetsGet(token, sheetId, range) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: "sheets.googleapis.com",
+        path: `/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(range)}`,
+        method: "GET",
+        headers: { Authorization: `Bearer ${token}` },
+      },
+      (res) => {
+        let d = "";
+        res.on("data", (c) => (d += c));
+        res.on("end", () => {
+          try {
+            resolve(JSON.parse(d));
+          } catch (e) {
+            reject(e);
+          }
+        });
+      },
+    );
+    req.on("error", reject);
+    req.end();
+  });
 }
 
-function getCommitAuthors(base) {
-  const log = git("log", `${base}..HEAD`, "--format=%H|%aN|%ae");
-  if (!log) return [];
-  return log
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => {
-      const [hash, name, email] = line.split("|");
-      return { hash, name, email };
-    });
+function sheetsAppend(token, sheetId, range, values) {
+  const body = JSON.stringify({ values });
+  const path =
+    `/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(range)}:append` +
+    `?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: "sheets.googleapis.com",
+        path,
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body),
+        },
+      },
+      (res) => {
+        let d = "";
+        res.on("data", (c) => (d += c));
+        res.on("end", () => {
+          res.statusCode >= 200 && res.statusCode < 300
+            ? resolve(JSON.parse(d))
+            : reject(new Error(`Sheets ${res.statusCode}: ${d}`));
+        });
+      },
+    );
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
 }
 
-function getDiffStats(base) {
-  const commits = git("log", `${base}..HEAD`, "--format=%H");
-  if (!commits) return {};
-  const stats = {};
-  for (const hash of commits.split("\n").filter(Boolean)) {
-    const raw = git("show", "--stat", "--format=", hash);
-    const files = [];
-    let totalAdded = 0,
-      totalDeleted = 0;
-    for (const line of raw.split("\n")) {
-      const m = line.match(/^\s*(.+?)\s+\|\s+\d+\s*([+\-]*)/);
-      if (m) {
-        const added = (m[2].match(/\+/g) || []).length;
-        const deleted = (m[2].match(/-/g) || []).length;
-        files.push({ file: m[1].trim(), added, deleted });
-        totalAdded += added;
-        totalDeleted += deleted;
-      }
-    }
-    stats[hash] = { added: totalAdded, deleted: totalDeleted, files };
-  }
-  return stats;
-}
-
-function getDiffSnapshot(base) {
-  const diff = git(
-    "diff",
-    `${base}..HEAD`,
-    "--",
-    ".",
-    ":(exclude)package-lock.json",
-    ":(exclude)*.lock",
-  );
-  return diff.slice(0, 2000);
-}
-
-// ─── DT member detection ──────────────────────────────────────────────────────
-function loadDtMembers() {
-  const env = process.env.DT_MEMBERS || "";
-  if (env.trim()) {
+// ─── Load DT members from dt_members tab ─────────────────────────────────────
+// Returns a Set of GitHub logins who are active DT members.
+// Falls back to DT_MEMBERS env var if tab is missing or empty.
+async function loadDtMembers(token, sheetId) {
+  try {
+    const res = await sheetsGet(token, sheetId, "dt_members!A:D");
+    const rows = (res.values || []).slice(1); // skip header row
     const members = new Set(
-      env
-        .split(",")
-        .map((s) => s.trim().toLowerCase())
+      rows
+        .filter((r) => r[3] !== "FALSE") // col D = active; skip inactive
+        .map((r) => (r[0] || "").trim().toLowerCase())
         .filter(Boolean),
     );
-    console.log(
-      `DT members loaded from DT_MEMBERS env (${members.size}): ${[...members].join(", ")}`,
-    );
-    return members;
+    if (members.size > 0) {
+      console.log(`Loaded ${members.size} DT members from sheet tab.`);
+      return members;
+    }
+  } catch (e) {
+    console.warn(`Could not read dt_members tab: ${e.message}`);
   }
-  const filePath = path.join(GIT_CWD, ".dt-members");
-  if (fs.existsSync(filePath)) {
-    const members = new Set(
-      fs
-        .readFileSync(filePath, "utf8")
-        .split("\n")
-        .map((s) => s.trim().toLowerCase())
-        .filter((s) => s && !s.startsWith("#")),
-    );
+  // Fallback to env var
+  if (dtMembersEnv.length > 0) {
     console.log(
-      `DT members loaded from .dt-members file (${members.size}): ${[...members].join(", ")}`,
+      `Using DT_MEMBERS env var fallback (${dtMembersEnv.length} members).`,
     );
-    return members;
+    return new Set(dtMembersEnv.map((m) => m.toLowerCase()));
   }
-  console.log("No DT member list found. Treating all authors as DT.");
+  console.warn(
+    'No DT member list found. author_type will default to "DT" for all authors.',
+  );
   return new Set();
 }
 
-function resolveLogin(name, email) {
-  const noReply = email.match(/^(\d+\+)?([^@]+)@users\.noreply\.github\.com$/);
-  if (noReply) return noReply[2].toLowerCase();
-  return name.toLowerCase().replace(/\s+/g, "-");
-}
-
-// ─── Core analysis ────────────────────────────────────────────────────────────
-function analyse(base) {
-  const commits = getCommits(base);
-  const authors = getCommitAuthors(base);
-  const diffStats = getDiffStats(base);
-  const dtMembers = loadDtMembers();
-  const diffSnap = getDiffSnapshot(base);
-
-  console.log(`[ANALYSE] commits=${commits.length} authors=${authors.length}`);
-
-  if (commits.length === 0) return null;
-
-  const authorMap = {};
-
-  for (const a of authors) {
-    const login = resolveLogin(a.name, a.email);
-    const type =
-      dtMembers.size === 0 ? "DT" : dtMembers.has(login) ? "DT" : "DEV";
-
-    if (!authorMap[login]) {
-      authorMap[login] = {
-        login,
-        name: a.name,
-        email: a.email,
-        author_type: type,
-        commit_count: 0,
-        lines_added: 0,
-        lines_deleted: 0,
-        shas: [],
-        dates: [],
-        messages: [],
-        filesMap: {},
-      };
-    }
-
-    const stat = diffStats[a.hash] || { added: 0, deleted: 0, files: [] };
-    const commit = commits.find(
-      (c) => a.hash.startsWith(c.hash) || c.hash.startsWith(a.hash.slice(0, 8)),
-    );
-
-    authorMap[login].commit_count++;
-    authorMap[login].lines_added += stat.added;
-    authorMap[login].lines_deleted += stat.deleted;
-    authorMap[login].shas.push(a.hash.slice(0, 8));
-    if (commit) {
-      authorMap[login].dates.push(commit.date);
-      authorMap[login].messages.push(commit.message);
-    }
-
-    for (const f of stat.files) {
-      if (!authorMap[login].filesMap[f.file]) {
-        authorMap[login].filesMap[f.file] = {
-          file: f.file,
-          dt_lines: 0,
-          dev_lines: 0,
-          total_lines: 0,
-        };
+// ─── Overwrite detection ──────────────────────────────────────────────────────
+// For each DEV author row: count lines they added in files that DT authors
+// touched in the same PR. This is the "overwrite on DT work" signal.
+function computeOverwrites(contributors) {
+  // Build set of files touched by DT authors in this PR
+  const dtFilesSet = new Set();
+  for (const c of contributors) {
+    if (c.author_type === "DT") {
+      for (const f of c.files_detail || []) {
+        dtFilesSet.add(f.file);
       }
-      authorMap[login].filesMap[f.file].total_lines += f.added;
-      if (type === "DT") authorMap[login].filesMap[f.file].dt_lines += f.added;
-      else authorMap[login].filesMap[f.file].dev_lines += f.added;
     }
   }
 
-  const contributors = Object.values(authorMap).map((a) => ({
-    author: a.login,
-    author_type: a.author_type,
-    commit_count: a.commit_count,
-    lines_added: a.lines_added,
-    lines_deleted: a.lines_deleted,
-    files_changed: Object.keys(a.filesMap).length,
-    commit_shas: a.shas,
-    commit_dates: a.dates,
-    commit_messages: a.messages,
-    files_detail: Object.values(a.filesMap),
+  // For each author, compute:
+  //   dt_files_touched     — which of their files overlap with dtFilesSet
+  //   dev_lines_on_dt_files — if DEV, how many lines they added on DT files
+  return contributors.map((c) => {
+    const myFiles = (c.files_detail || []).map((f) => f.file);
+    const dtOverlap = myFiles.filter((f) => dtFilesSet.has(f));
+    const devLinesOnDt =
+      c.author_type === "DEV"
+        ? (c.files_detail || [])
+            .filter((f) => dtFilesSet.has(f.file))
+            .reduce((sum, f) => sum + (f.total_lines || 0), 0)
+        : 0;
+    return {
+      ...c,
+      dt_files_touched: dtOverlap.join(","),
+      dev_lines_on_dt_files: devLinesOnDt,
+    };
+  });
+}
+
+// ─── Build sheet rows ─────────────────────────────────────────────────────────
+// Returns { logRows, diffRows }
+// logRows  → raw_logs tab  (lean, Looker-facing, no large-text cells)
+// diffRows → raw_diffs tab (heavy text, AI-layer-facing, one row per PR)
+function buildRows(payload, dtMembers) {
+  const {
+    repo,
+    pr_number,
+    pr_title,
+    base_branch,
+    pr_url,
+    workflow_run_id,
+    timestamp,
+    diff_snapshot = "",
+    contributors = [],
+  } = payload;
+
+  const featureTag = deriveFeatureTag(base_branch);
+  const ts = timestamp || new Date().toISOString();
+
+  const resolved = contributors.map((c) => ({
+    ...c,
+    author_type:
+      c.author_type ||
+      (dtMembers.size === 0
+        ? "DT"
+        : dtMembers.has((c.author || "").toLowerCase())
+          ? "DT"
+          : "DEV"),
   }));
 
-  const dtFilesSet = new Set(
-    contributors
-      .filter((c) => c.author_type === "DT")
-      .flatMap((c) => c.files_detail.map((f) => f.file)),
-  );
+  const withOverwrites = computeOverwrites(resolved);
 
-  return {
-    contributors: contributors.map((c) => {
-      const dtOverlap = c.files_detail.filter((f) => dtFilesSet.has(f.file));
-      const devLinesOnDtFiles =
-        c.author_type === "DEV"
-          ? dtOverlap.reduce((s, f) => s + f.total_lines, 0)
-          : 0;
-      return {
-        ...c,
-        dt_files_touched: dtOverlap.map((f) => f.file).join(","),
-        dev_lines_on_dt_files: devLinesOnDtFiles,
-      };
-    }),
-    diffSnapshot: diffSnap,
-  };
+  // ── raw_logs rows (one per author — lean columns only) ────────────────────
+  const logRows = withOverwrites.map((c) => [
+    ts, // A  timestamp
+    repo, // B  repo
+    pr_number, // C  pr_number
+    pr_title, // D  pr_title
+    base_branch, // E  base_branch
+    featureTag, // F  feature_tag
+    c.author, // G  author
+    c.author_type, // H  author_type
+    c.commit_count, // I  commit_count
+    c.lines_added, // J  lines_added
+    c.lines_deleted, // K  lines_deleted
+    c.files_changed, // L  files_changed
+    (c.commit_shas || []).join(","), // M  commit_shas
+    (c.commit_dates || []).join(","), // N  commit_dates
+    c.dt_files_touched, // O  dt_files_touched
+    c.dev_lines_on_dt_files, // P  dev_lines_on_dt_files
+    workflow_run_id, // Q  workflow_run_id (FK to raw_diffs)
+    pr_url, // R  pr_url
+  ]);
+
+  // ── raw_diffs row (one per PR — heavy text, linked by workflow_run_id) ────
+  // commit_messages and files_detail live here, not in raw_logs
+  const allCommitMessages = withOverwrites
+    .flatMap((c) => c.commit_messages || [])
+    .filter((v, i, a) => a.indexOf(v) === i) // deduplicate
+    .join(" | ");
+
+  const allFilesDetail = withOverwrites.flatMap((c) => c.files_detail || []);
+
+  const diffRows = [
+    [
+      ts, // A  timestamp
+      repo, // B  repo
+      pr_number, // C  pr_number
+      workflow_run_id, // D  workflow_run_id (PK)
+      allCommitMessages, // E  commit_messages (all authors)
+      JSON.stringify(allFilesDetail), // F  files_detail (all authors, JSON)
+      diff_snapshot.slice(0, 2000), // G  diff_snapshot
+    ],
+  ];
+
+  return { logRows, diffRows };
 }
 
-// ─── Markdown builder ─────────────────────────────────────────────────────────
-function buildMarkdown(result, base) {
-  const { contributors } = result;
-  const dtC = contributors.filter((c) => c.author_type === "DT");
-  const totalCommits = contributors.reduce((s, c) => s + c.commit_count, 0);
-  const dtCommits = dtC.reduce((s, c) => s + c.commit_count, 0);
-  const totalAdded = contributors.reduce((s, c) => s + c.lines_added, 0);
-  const dtAdded = dtC.reduce((s, c) => s + c.lines_added, 0);
-  const dtPct =
-    totalAdded > 0 ? ((dtAdded / totalAdded) * 100).toFixed(1) : "0.0";
-
-  const allFilesMap = {};
-  for (const c of contributors) {
-    for (const f of c.files_detail) {
-      if (!allFilesMap[f.file])
-        allFilesMap[f.file] = { file: f.file, dt_lines: 0, total_lines: 0 };
-      allFilesMap[f.file].dt_lines += f.dt_lines || 0;
-      allFilesMap[f.file].total_lines += f.total_lines || 0;
-    }
+// ─── Deduplication ────────────────────────────────────────────────────────────
+async function isDuplicate(token, sheetId, runId) {
+  if (!runId) return false;
+  try {
+    const res = await sheetsGet(token, sheetId, "raw_logs!T:T"); // workflow_run_id col
+    const vals = (res.values || []).flat();
+    return vals.includes(String(runId));
+  } catch {
+    return false;
   }
-  const allFiles = Object.values(allFilesMap).sort(
-    (a, b) => b.total_lines - a.total_lines,
-  );
-  const allCommits = contributors
-    .flatMap((c) =>
-      c.commit_shas.map((sha, i) => ({
-        sha,
-        date: c.commit_dates[i] || "",
-        message: c.commit_messages[i] || "",
-        author: c.author,
-        type: c.author_type,
-      })),
-    )
-    .sort((a, b) => b.date.localeCompare(a.date));
-
-  const lines = [];
-  lines.push("## DT Contribution Report", "");
-  lines.push(`**Branch:** \`HEAD\``);
-  lines.push(`**Base:** \`${base}\``);
-  lines.push(
-    `**Generated:** ${new Date().toISOString().replace("T", " ").slice(0, 19)}`,
-    "",
-  );
-  lines.push("### Summary", "");
-  lines.push("| Metric | Value |", "|---|---|");
-  lines.push(`| Total commits | ${totalCommits} |`);
-  lines.push(`| DT commits | ${dtCommits} |`);
-  lines.push(`| Developer commits | ${totalCommits - dtCommits} |`);
-  lines.push(`| Total lines added | ${totalAdded} |`);
-  lines.push(`| DT lines added | ${dtAdded} |`);
-  lines.push(`| **DT contribution** | **${dtPct}%** |`);
-  lines.push(`| Files touched | ${allFiles.length} |`, "");
-
-  if (allFiles.length > 0) {
-    lines.push("### Per-File Breakdown", "");
-    lines.push("| File | DT Lines | Total Lines | DT% |", "|---|---|---|---|");
-    for (const f of allFiles) {
-      const pct =
-        f.total_lines > 0
-          ? ((f.dt_lines / f.total_lines) * 100).toFixed(1)
-          : "0.0";
-      lines.push(
-        `| \`${f.file}\` | ${f.dt_lines} | ${f.total_lines} | ${pct}% |`,
-      );
-    }
-    lines.push("");
-  }
-
-  if (allCommits.length > 0) {
-    lines.push("### DT Commit Log", "");
-    lines.push(
-      "| Hash | Date | Author | Type | Message |",
-      "|---|---|---|---|---|",
-    );
-    for (const c of allCommits) {
-      const badge = c.type === "DT" ? "🟢 DT" : "🔵 DEV";
-      lines.push(
-        `| \`${c.sha}\` | ${c.date} | ${c.author} | ${badge} | ${c.message} |`,
-      );
-    }
-    lines.push("");
-  }
-
-  const overwrites = contributors.filter(
-    (c) => c.author_type === "DEV" && c.dev_lines_on_dt_files > 0,
-  );
-  if (overwrites.length > 0) {
-    lines.push("### Overwrites on DT Work", "");
-    lines.push("| Author | Lines on DT Files | Files |", "|---|---|---|");
-    for (const c of overwrites) {
-      lines.push(
-        `| ${c.author} | ${c.dev_lines_on_dt_files} | \`${c.dt_files_touched.replace(/,/g, "`, `")}\` |`,
-      );
-    }
-    lines.push("");
-  }
-
-  return lines.join("\n");
-}
-
-// ─── JSON payload builder ─────────────────────────────────────────────────────
-function buildPayload(result, base) {
-  return {
-    timestamp: new Date().toISOString(),
-    repo: process.env.GH_REPO || "",
-    pr_number: process.env.GH_PR_NUMBER || "",
-    pr_title: process.env.GH_PR_TITLE || "",
-    pr_url: process.env.GH_PR_URL || "",
-    base_branch: base.replace(/^origin\//, ""),
-    workflow_run_id: process.env.GH_RUN_ID || "",
-    diff_snapshot: result.diffSnapshot,
-    contributors: result.contributors,
-  };
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
-(function main() {
-  console.log(`Analysing commits from ${baseRef} to HEAD…`);
+(async () => {
+  try {
+    console.log("Authenticating with Google…");
+    const token = await getAccessToken(creds);
 
-  const result = analyse(baseRef);
+    const alreadyLogged = await isDuplicate(
+      token,
+      sheetId,
+      payload.workflow_run_id,
+    );
+    if (alreadyLogged) {
+      console.log(
+        `workflow_run_id ${payload.workflow_run_id} already logged. Skipping.`,
+      );
+      process.exit(0);
+    }
 
-  if (!result || result.contributors.length === 0) {
-    console.log("No commits found between base and HEAD.");
-    fs.writeFileSync(path.join(OUT_DIR, "report-output.txt"), "", "utf8");
-    fs.writeFileSync(path.join(OUT_DIR, "report-payload.json"), "{}", "utf8");
-    process.exit(0);
+    console.log("Loading DT member list…");
+    const dtMembers = await loadDtMembers(token, sheetId);
+
+    const { logRows, diffRows } = buildRows(payload, dtMembers);
+    if (logRows.length === 0) {
+      console.log("No contributor rows to append. Skipping.");
+      process.exit(0);
+    }
+
+    console.log(`Appending ${logRows.length} row(s) to raw_logs…`);
+    const r1 = await sheetsAppend(token, sheetId, "raw_logs!A:R", logRows);
+    console.log(`raw_logs updated: ${r1.updates?.updatedRange}`);
+
+    console.log("Appending 1 row to raw_diffs…");
+    const r2 = await sheetsAppend(token, sheetId, "raw_diffs!A:G", diffRows);
+    console.log(`raw_diffs updated: ${r2.updates?.updatedRange}`);
+  } catch (err) {
+    console.error("push-to-sheets failed:", err.message);
+    process.exit(1);
   }
-
-  const markdown = buildMarkdown(result, baseRef);
-  const reportText = dryRun
-    ? ["DRY RUN: Report preview", markdown, "End of dry run"].join("\n")
-    : markdown;
-
-  const reportPath = path.join(OUT_DIR, "report-output.txt");
-  const payloadPath = path.join(OUT_DIR, "report-payload.json");
-  const payload = buildPayload(result, baseRef);
-
-  fs.writeFileSync(reportPath, reportText, "utf8");
-  fs.writeFileSync(payloadPath, JSON.stringify(payload, null, 2), "utf8");
-
-  console.log(`Written: ${reportPath}`);
-  console.log(`Written: ${payloadPath}`);
-
-  const dtC = result.contributors.filter((c) => c.author_type === "DT");
-  const totAdded = result.contributors.reduce((s, c) => s + c.lines_added, 0);
-  const dtAdded = dtC.reduce((s, c) => s + c.lines_added, 0);
-  console.log(`Contributors: ${result.contributors.length} (${dtC.length} DT)`);
-  console.log(
-    `Lines: ${dtAdded}/${totAdded} DT (${totAdded > 0 ? ((dtAdded / totAdded) * 100).toFixed(1) : 0}%)`,
-  );
 })();

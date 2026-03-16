@@ -3,27 +3,22 @@
  * dt-cb-git-contribution-tracker.js
  *
  * Analyses git commits on a branch against a base ref and produces:
- *   1. report-output.txt  — markdown report (for PR comment, backward-compat)
+ *   1. report-output.txt   — markdown report (for PR comment)
  *   2. report-payload.json — structured JSON (for push-to-sheets.js)
  *
  * Usage:
- *   node dt-contribution-tracker.js --base origin/dt/skills-test
- *   node dt-contribution-tracker.js --base origin/dt/skills-test --dry-run
+ *   node dt-cb-git-contribution-tracker.js \
+ *     --base origin/dt/skills-test \
+ *     --repo-dir /absolute/path/to/repo \
+ *     --dry-run
  *
- * --dry-run wraps the markdown in the DRY RUN markers the existing YAML expects.
- * Both output files are always written regardless of --dry-run.
+ * DT member detection (priority order):
+ *   1. DT_MEMBERS env var  e.g. "alice,bob,carol"
+ *   2. .dt-members file in repo root (one login per line)
+ *   3. Treats ALL authors as DT if neither is set
  *
- * DT member detection (in priority order):
- *   1. DT_MEMBERS env var  "alice,bob,carol"
- *   2. .dt-members file in repo root  (one login per line)
- *   3. Falls back to treating ALL authors as DT if neither is set
- *
- * Environment variables injected by GitHub Actions workflow:
- *   GH_REPO        ${{ github.repository }}
- *   GH_PR_NUMBER   ${{ github.event.pull_request.number }}
- *   GH_PR_TITLE    ${{ github.event.pull_request.title }}
- *   GH_PR_URL      ${{ github.event.pull_request.html_url }}
- *   GH_RUN_ID      ${{ github.run_id }}
+ * GitHub Actions env vars (injected by YAML):
+ *   GH_REPO, GH_PR_NUMBER, GH_PR_TITLE, GH_PR_URL, GH_RUN_ID
  */
 
 "use strict";
@@ -32,23 +27,26 @@ const { execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
-// Output files always written to the runner working directory (process.cwd())
-// which is the runner root when invoked from CI without working-directory set.
-const OUT_DIR = process.cwd();
-
+// ─── CLI args — parse FIRST before anything else ─────────────────────────────
 const args = process.argv.slice(2);
 const baseRef = args[args.indexOf("--base") + 1] || "HEAD~1";
 const dryRun = args.includes("--dry-run");
+const repoDirIdx = args.indexOf("--repo-dir");
+const repoDir = repoDirIdx !== -1 ? args[repoDirIdx + 1] : null;
 
-// ─── Git working directory ────────────────────────────────────────────────────
-// GIT_WORK_DIR is injected by the YAML as an absolute path to the checked-out
-// PR repo. Use it directly — do NOT path.resolve() it as that resolves
-// relative to the script's own location inside dt-tools, not the runner root.
-const GIT_CWD = process.env.GIT_WORK_DIR || process.cwd();
+console.log(`[ARGS] base=${baseRef} dryRun=${dryRun} repoDir=${repoDir}`);
+console.log(`[ARGS] full argv=${JSON.stringify(process.argv)}`);
 
-console.log(`Git working directory: ${GIT_CWD}`);
+// ─── Paths ────────────────────────────────────────────────────────────────────
+// GIT_CWD: where git commands run — must be the PR repo checkout
+// OUT_DIR: where output files are written — always runner root (process.cwd())
+const GIT_CWD = repoDir || process.env.GIT_WORK_DIR || process.cwd();
+const OUT_DIR = process.cwd();
 
-// ─── Git helpers ─────────────────────────────────────────────────────────────
+console.log(`[PATHS] GIT_CWD=${GIT_CWD}`);
+console.log(`[PATHS] OUT_DIR=${OUT_DIR}`);
+
+// ─── Git helpers ──────────────────────────────────────────────────────────────
 function git(cmd) {
   try {
     return execSync(`git ${cmd}`, {
@@ -61,7 +59,7 @@ function git(cmd) {
   }
 }
 
-// Returns array of { hash, date, author, message }
+// ─── Git data fetchers ────────────────────────────────────────────────────────
 function getCommits(base) {
   const log = git(`log ${base}..HEAD --format=%H|%as|%ae|%s`);
   if (!log) return [];
@@ -70,8 +68,6 @@ function getCommits(base) {
     .filter(Boolean)
     .map((line) => {
       const [hash, date, email, ...msgParts] = line.split("|");
-      // Use the part before @ in the email as a fallback login approximation
-      // The real GitHub login comes from commit author name if available
       return {
         hash: hash.slice(0, 8),
         date,
@@ -81,7 +77,6 @@ function getCommits(base) {
     });
 }
 
-// Returns array of { hash, author (name), email }
 function getCommitAuthors(base) {
   const log = git(`log ${base}..HEAD --format=%H|%aN|%ae`);
   if (!log) return [];
@@ -94,7 +89,6 @@ function getCommitAuthors(base) {
     });
 }
 
-// Returns { [hash]: { added, deleted, files: [{file, added, deleted}] } }
 function getDiffStats(base) {
   const commits = git(`log ${base}..HEAD --format=%H`);
   if (!commits) return {};
@@ -105,7 +99,6 @@ function getDiffStats(base) {
     let totalAdded = 0,
       totalDeleted = 0;
     for (const line of raw.split("\n")) {
-      // e.g. "src/foo.ts | 12 +++++-----"
       const m = line.match(/^\s*(.+?)\s+\|\s+\d+\s*([+\-]*)/);
       if (m) {
         const added = (m[2].match(/\+/g) || []).length;
@@ -120,17 +113,15 @@ function getDiffStats(base) {
   return stats;
 }
 
-// Returns first 2000 chars of the combined diff
 function getDiffSnapshot(base) {
   const diff = git(
-    `diff ${base}..HEAD -- . ':(exclude)package-lock.json' ':(exclude)*.lock'`,
+    `diff ${base}..HEAD -- . ":(exclude)package-lock.json" ":(exclude)*.lock"`,
   );
   return diff.slice(0, 2000);
 }
 
-// ─── DT member detection ─────────────────────────────────────────────────────
+// ─── DT member detection ──────────────────────────────────────────────────────
 function loadDtMembers() {
-  // Priority 1: env var
   const env = process.env.DT_MEMBERS || "";
   if (env.trim()) {
     const members = new Set(
@@ -144,8 +135,7 @@ function loadDtMembers() {
     );
     return members;
   }
-  // Priority 2: .dt-members file in repo root
-  const filePath = path.join(process.cwd(), ".dt-members");
+  const filePath = path.join(GIT_CWD, ".dt-members");
   if (fs.existsSync(filePath)) {
     const members = new Set(
       fs
@@ -159,23 +149,17 @@ function loadDtMembers() {
     );
     return members;
   }
-  // Priority 3: no list — treat all as DT
   console.log("No DT member list found. Treating all authors as DT.");
   return new Set();
 }
 
-// Resolve GitHub login from email/name
-// git log gives us name + email; GitHub login = name lowercased with spaces→hyphens
-// (best effort — override via DT_MEMBERS with exact logins)
 function resolveLogin(name, email) {
-  // Some setups embed login in email as login@users.noreply.github.com
   const noReply = email.match(/^(\d+\+)?([^@]+)@users\.noreply\.github\.com$/);
   if (noReply) return noReply[2].toLowerCase();
-  // Fall back to name → login approximation
   return name.toLowerCase().replace(/\s+/g, "-");
 }
 
-// ─── Core analysis ───────────────────────────────────────────────────────────
+// ─── Core analysis ────────────────────────────────────────────────────────────
 function analyse(base) {
   const commits = getCommits(base);
   const authors = getCommitAuthors(base);
@@ -183,10 +167,11 @@ function analyse(base) {
   const dtMembers = loadDtMembers();
   const diffSnap = getDiffSnapshot(base);
 
+  console.log(`[ANALYSE] commits=${commits.length} authors=${authors.length}`);
+
   if (commits.length === 0) return null;
 
-  // Build per-author map
-  const authorMap = {}; // login → { name, email, type, commits[], shas[], dates[], messages[], filesMap }
+  const authorMap = {};
 
   for (const a of authors) {
     const login = resolveLogin(a.name, a.email);
@@ -205,7 +190,7 @@ function analyse(base) {
         shas: [],
         dates: [],
         messages: [],
-        filesMap: {}, // file → { dt_lines, total_lines }
+        filesMap: {},
       };
     }
 
@@ -223,7 +208,6 @@ function analyse(base) {
       authorMap[login].messages.push(commit.message);
     }
 
-    // Per-file accumulation
     for (const f of stat.files) {
       if (!authorMap[login].filesMap[f.file]) {
         authorMap[login].filesMap[f.file] = {
@@ -239,7 +223,6 @@ function analyse(base) {
     }
   }
 
-  // Build contributors array
   const contributors = Object.values(authorMap).map((a) => ({
     author: a.login,
     author_type: a.author_type,
@@ -253,7 +236,6 @@ function analyse(base) {
     files_detail: Object.values(a.filesMap),
   }));
 
-  // Overwrite detection: which DT files did DEV authors touch?
   const dtFilesSet = new Set(
     contributors
       .filter((c) => c.author_type === "DT")
@@ -273,19 +255,13 @@ function analyse(base) {
     };
   });
 
-  return {
-    contributors: finalContributors,
-    diffSnapshot: diffSnap,
-    dtFilesSet,
-  };
+  return { contributors: finalContributors, diffSnapshot: diffSnap };
 }
 
-// ─── Markdown report builder ─────────────────────────────────────────────────
+// ─── Markdown builder ─────────────────────────────────────────────────────────
 function buildMarkdown(result, base) {
   const { contributors } = result;
   const dtC = contributors.filter((c) => c.author_type === "DT");
-  const devC = contributors.filter((c) => c.author_type === "DEV");
-
   const totalCommits = contributors.reduce((s, c) => s + c.commit_count, 0);
   const dtCommits = dtC.reduce((s, c) => s + c.commit_count, 0);
   const totalAdded = contributors.reduce((s, c) => s + c.lines_added, 0);
@@ -293,12 +269,11 @@ function buildMarkdown(result, base) {
   const dtPct =
     totalAdded > 0 ? ((dtAdded / totalAdded) * 100).toFixed(1) : "0.0";
 
-  // All files across all contributors
   const allFilesMap = {};
   for (const c of contributors) {
     for (const f of c.files_detail) {
       if (!allFilesMap[f.file])
-        allFilesMap[f.file] = { dt_lines: 0, total_lines: 0 };
+        allFilesMap[f.file] = { file: f.file, dt_lines: 0, total_lines: 0 };
       allFilesMap[f.file].dt_lines += f.dt_lines || 0;
       allFilesMap[f.file].total_lines += f.total_lines || 0;
     }
@@ -306,8 +281,6 @@ function buildMarkdown(result, base) {
   const allFiles = Object.values(allFilesMap).sort(
     (a, b) => b.total_lines - a.total_lines,
   );
-
-  // All commits sorted by date desc
   const allCommits = contributors
     .flatMap((c) =>
       c.commit_shas.map((sha, i) => ({
@@ -321,32 +294,26 @@ function buildMarkdown(result, base) {
     .sort((a, b) => b.date.localeCompare(a.date));
 
   const lines = [];
-  lines.push("## DT Contribution Report");
-  lines.push("");
+  lines.push("## DT Contribution Report", "");
   lines.push(`**Branch:** \`HEAD\``);
   lines.push(`**Base:** \`${base}\``);
   lines.push(
     `**Generated:** ${new Date().toISOString().replace("T", " ").slice(0, 19)}`,
+    "",
   );
-  lines.push("");
-  lines.push("### Summary");
-  lines.push("");
-  lines.push("| Metric | Value |");
-  lines.push("|---|---|");
+  lines.push("### Summary", "");
+  lines.push("| Metric | Value |", "|---|---|");
   lines.push(`| Total commits | ${totalCommits} |`);
   lines.push(`| DT commits | ${dtCommits} |`);
   lines.push(`| Developer commits | ${totalCommits - dtCommits} |`);
   lines.push(`| Total lines added | ${totalAdded} |`);
   lines.push(`| DT lines added | ${dtAdded} |`);
   lines.push(`| **DT contribution** | **${dtPct}%** |`);
-  lines.push(`| Files touched | ${allFiles.length} |`);
-  lines.push("");
+  lines.push(`| Files touched | ${allFiles.length} |`, "");
 
   if (allFiles.length > 0) {
-    lines.push("### Per-File Breakdown");
-    lines.push("");
-    lines.push("| File | DT Lines | Total Lines | DT% |");
-    lines.push("|---|---|---|---|");
+    lines.push("### Per-File Breakdown", "");
+    lines.push("| File | DT Lines | Total Lines | DT% |", "|---|---|---|---|");
     for (const f of allFiles) {
       const pct =
         f.total_lines > 0
@@ -360,10 +327,11 @@ function buildMarkdown(result, base) {
   }
 
   if (allCommits.length > 0) {
-    lines.push("### DT Commit Log");
-    lines.push("");
-    lines.push("| Hash | Date | Author | Type | Message |");
-    lines.push("|---|---|---|---|---|");
+    lines.push("### DT Commit Log", "");
+    lines.push(
+      "| Hash | Date | Author | Type | Message |",
+      "|---|---|---|---|---|",
+    );
     for (const c of allCommits) {
       const badge = c.type === "DT" ? "🟢 DT" : "🔵 DEV";
       lines.push(
@@ -373,15 +341,12 @@ function buildMarkdown(result, base) {
     lines.push("");
   }
 
-  // Overwrite section (only if DEV touched DT files)
   const overwrites = contributors.filter(
     (c) => c.author_type === "DEV" && c.dev_lines_on_dt_files > 0,
   );
   if (overwrites.length > 0) {
-    lines.push("### Overwrites on DT Work");
-    lines.push("");
-    lines.push("| Author | Lines on DT Files | Files |");
-    lines.push("|---|---|---|");
+    lines.push("### Overwrites on DT Work", "");
+    lines.push("| Author | Lines on DT Files | Files |", "|---|---|---|");
     for (const c of overwrites) {
       lines.push(
         `| ${c.author} | ${c.dev_lines_on_dt_files} | \`${c.dt_files_touched.replace(/,/g, "`, `")}\` |`,
@@ -393,7 +358,7 @@ function buildMarkdown(result, base) {
   return lines.join("\n");
 }
 
-// ─── JSON payload builder ────────────────────────────────────────────────────
+// ─── JSON payload builder ─────────────────────────────────────────────────────
 function buildPayload(result, base) {
   return {
     timestamp: new Date().toISOString(),
@@ -408,58 +373,39 @@ function buildPayload(result, base) {
   };
 }
 
-// ─── Main ────────────────────────────────────────────────────────────────────
+// ─── Main ─────────────────────────────────────────────────────────────────────
 (function main() {
   console.log(`Analysing commits from ${baseRef} to HEAD…`);
-
-  // ── inline debug — remove after fix ──────────────────────────────────────
-  console.log(`[DEBUG] GIT_CWD = ${GIT_CWD}`);
-  console.log(`[DEBUG] git rev-parse HEAD = ${git("rev-parse HEAD")}`);
-  console.log(
-    `[DEBUG] git log raw = ${git(`log ${baseRef}..HEAD --format=%H|%as|%ae|%s`)}`,
-  );
-  console.log(`[DEBUG] git branch -a = ${git("branch -a")}`);
-  console.log(`[DEBUG] git remote -v = ${git("remote -v")}`);
-  // ── end debug ─────────────────────────────────────────────────────────────
 
   const result = analyse(baseRef);
 
   if (!result || result.contributors.length === 0) {
     console.log("No commits found between base and HEAD.");
-    // Write empty markers so the YAML comment step exits cleanly
     fs.writeFileSync(path.join(OUT_DIR, "report-output.txt"), "", "utf8");
     fs.writeFileSync(path.join(OUT_DIR, "report-payload.json"), "{}", "utf8");
     process.exit(0);
   }
 
-  // ── Write markdown (report-output.txt) ──────────────────────────────────
   const markdown = buildMarkdown(result, baseRef);
-
-  let reportText;
-  if (dryRun) {
-    // Wrap in markers the existing YAML comment step expects
-    reportText = ["DRY RUN: Report preview", markdown, "End of dry run"].join(
-      "\n",
-    );
-  } else {
-    reportText = markdown;
-  }
+  const reportText = dryRun
+    ? ["DRY RUN: Report preview", markdown, "End of dry run"].join("\n")
+    : markdown;
 
   const reportPath = path.join(OUT_DIR, "report-output.txt");
   const payloadPath = path.join(OUT_DIR, "report-payload.json");
+  const payload = buildPayload(result, baseRef); // ← defined before use
 
   fs.writeFileSync(reportPath, reportText, "utf8");
-  console.log(`Written: ${reportPath}`);
-
   fs.writeFileSync(payloadPath, JSON.stringify(payload, null, 2), "utf8");
+
+  console.log(`Written: ${reportPath}`);
   console.log(`Written: ${payloadPath}`);
 
-  // Summary to stdout
   const dtC = result.contributors.filter((c) => c.author_type === "DT");
-  const totalAdded = result.contributors.reduce((s, c) => s + c.lines_added, 0);
+  const totAdded = result.contributors.reduce((s, c) => s + c.lines_added, 0);
   const dtAdded = dtC.reduce((s, c) => s + c.lines_added, 0);
   console.log(`Contributors: ${result.contributors.length} (${dtC.length} DT)`);
   console.log(
-    `Lines: ${dtAdded}/${totalAdded} DT (${totalAdded > 0 ? ((dtAdded / totalAdded) * 100).toFixed(1) : 0}%)`,
+    `Lines: ${dtAdded}/${totAdded} DT (${totAdded > 0 ? ((dtAdded / totAdded) * 100).toFixed(1) : 0}%)`,
   );
 })();

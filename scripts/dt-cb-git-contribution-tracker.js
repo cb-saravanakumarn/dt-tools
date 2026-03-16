@@ -413,6 +413,16 @@ function buildPayload(result, base) {
 (function main() {
   console.log(`Analysing commits from ${baseRef} to HEAD…`);
 
+  // ── inline debug — remove after fix ──────────────────────────────────────
+  console.log(`[DEBUG] GIT_CWD = ${GIT_CWD}`);
+  console.log(`[DEBUG] git rev-parse HEAD = ${git("rev-parse HEAD")}`);
+  console.log(
+    `[DEBUG] git log raw = ${git(`log ${baseRef}..HEAD --format=%H|%as|%ae|%s`)}`,
+  );
+  console.log(`[DEBUG] git branch -a = ${git("branch -a")}`);
+  console.log(`[DEBUG] git remote -v = ${git("remote -v")}`);
+  // ── end debug ─────────────────────────────────────────────────────────────
+
   const result = analyse(baseRef);
 
   if (!result || result.contributors.length === 0) {

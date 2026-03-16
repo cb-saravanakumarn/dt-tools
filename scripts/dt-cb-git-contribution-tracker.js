@@ -46,6 +46,26 @@ const OUT_DIR = process.cwd();
 console.log(`[PATHS] GIT_CWD=${GIT_CWD}`);
 console.log(`[PATHS] OUT_DIR=${OUT_DIR}`);
 
+// Quick git sanity check
+try {
+  const headHash = execSync("git rev-parse HEAD", {
+    cwd: GIT_CWD,
+    encoding: "utf8",
+  }).trim();
+  const logCount = execSync(
+    `git log ${process.argv[process.argv.indexOf("--base") + 1]}..HEAD --oneline`,
+    { cwd: GIT_CWD, encoding: "utf8" },
+  ).trim();
+  console.log(`[GIT SANITY] HEAD=${headHash}`);
+  console.log(
+    `[GIT SANITY] log count=${logCount.split("\n").filter(Boolean).length}`,
+  );
+  console.log(`[GIT SANITY] log output=\n${logCount}`);
+} catch (e) {
+  console.log(`[GIT SANITY ERROR] ${e.message}`);
+  console.log(`[GIT SANITY STDERR] ${e.stderr}`);
+}
+
 // ─── Git helpers ──────────────────────────────────────────────────────────────
 function git(cmd) {
   try {
@@ -55,6 +75,9 @@ function git(cmd) {
       cwd: GIT_CWD,
     }).trim();
   } catch (e) {
+    console.log(
+      `[GIT ERROR] cmd="git ${cmd}" err=${e.message} stderr=${e.stderr}`,
+    );
     return "";
   }
 }

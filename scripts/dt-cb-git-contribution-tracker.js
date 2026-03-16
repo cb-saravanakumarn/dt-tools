@@ -38,11 +38,16 @@ const baseRef = args[args.indexOf("--base") + 1] || "HEAD~1";
 const dryRun = args.includes("--dry-run");
 
 // ─── Git helpers ─────────────────────────────────────────────────────────────
+// cwd defaults to process.cwd() — override via GIT_WORK_DIR env if the script
+// is invoked from a different directory than the repo (e.g. CI runner root).
+const GIT_CWD = process.env.GIT_WORK_DIR || process.cwd();
+
 function git(cmd) {
   try {
     return execSync(`git ${cmd}`, {
       encoding: "utf8",
       stdio: ["pipe", "pipe", "pipe"],
+      cwd: GIT_CWD,
     }).trim();
   } catch (e) {
     return "";

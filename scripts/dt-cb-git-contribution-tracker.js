@@ -41,11 +41,10 @@ const baseRef = args[args.indexOf("--base") + 1] || "HEAD~1";
 const dryRun = args.includes("--dry-run");
 
 // ─── Git working directory ────────────────────────────────────────────────────
-// When invoked from CI runner root, GIT_WORK_DIR points to the checked-out repo.
-// Falls back to process.cwd() for local runs.
-const GIT_CWD = process.env.GIT_WORK_DIR
-  ? require("path").resolve(process.env.GIT_WORK_DIR)
-  : process.cwd();
+// GIT_WORK_DIR is injected by the YAML as an absolute path to the checked-out
+// PR repo. Use it directly — do NOT path.resolve() it as that resolves
+// relative to the script's own location inside dt-tools, not the runner root.
+const GIT_CWD = process.env.GIT_WORK_DIR || process.cwd();
 
 console.log(`Git working directory: ${GIT_CWD}`);
 

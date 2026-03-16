@@ -120,7 +120,17 @@ async function getAccessToken(creds) {
   });
 }
 
-// ─── Sheets API helpers ────────────────────────────────────────────────────────
+// ─── Cell size safety ─────────────────────────────────────────────────────────
+// Google Sheets hard limit: 50,000 chars per cell.
+// We cap well below that to leave headroom.
+const CELL_LIMIT = 40000;
+
+function safeCell(value) {
+  if (typeof value !== "string") return value;
+  return value.length > CELL_LIMIT
+    ? value.slice(0, CELL_LIMIT) + `\n[truncated — ${value.length} total chars]`
+    : value;
+}
 function sheetsGet(token, sheetId, range) {
   return new Promise((resolve, reject) => {
     const req = https.request(

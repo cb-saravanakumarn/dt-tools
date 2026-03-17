@@ -354,17 +354,8 @@ async function isDuplicate(token, sheetId, runId) {
     console.log("Authenticating with Google…");
     const token = await getAccessToken(creds);
 
-    const alreadyLogged = await isDuplicate(
-      token,
-      sheetId,
-      payload.workflow_run_id,
-    );
-    if (alreadyLogged) {
-      console.log(
-        `workflow_run_id ${payload.workflow_run_id} already logged. Skipping.`,
-      );
-      process.exit(0);
-    }
+    const alreadyLogged = await isDuplicate(token, sheetId, payload);
+    if (alreadyLogged) process.exit(0);
 
     console.log("Loading DT member list…");
     const dtMembers = await loadDtMembers(token, sheetId);
